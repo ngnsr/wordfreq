@@ -10,7 +10,7 @@
 #define MAX_BUFFER_SIZE (1 << 26) // 64MB max buffer
 #define CHUNK_SIZE 8192           // File read chunk size
 
-int verbose = 1;
+int verbose = 0;
 #define LOG(rank, fmt, ...)                                                    \
   do {                                                                         \
     if (verbose)                                                               \
@@ -282,109 +282,140 @@ void print_results(HashMap *map, int top_n) {
 }
 
 int main(int argc, char **argv) {
-  MPI_Init(&argc, &argv);
-  int rank, size;
-  char *delims = " ,.!?;:\n";
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Init(&argc, &argv);
+    int rank, size;
+    char *delims = " ,.!?;:\n";
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-  if (argc < 2) {
-    if (rank == 0)
-      fprintf(stderr, "Usage: %s <file1> [file2 ...]\n", argv[0]);
+    if (argc < 2) {
+        if (rank == 0)
+            fprintf(stderr, "Usage: %s <file1> [file2 ...]\n", argv[0]);
+        MPI_Finalize();
+        return 1;
+    }
+
+    double start_time = MPI_Wtime();
+    int num_files = argc - 1;
+    int max_filename_len = 256;
+    char *filename_buffer = NULL;
+    char **filenames = NULL;
+    int total_buffer_size;
+
+    if (rank == 0) {
+        filenames = malloc(num_files * sizeof(char *));
+        total_buffer_size = num_files * max_filename_len;
+        filename_buffer = malloc(total_buffer_size * sizeof(char));
+        if (!filenames || !filename_buffer) {
+            LOG(0, "Failed to allocate filename buffers");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        char *ptr = filename_buffer;
+        for (int i = 0; i < num_files; i++) {
+            filenames[i] = ptr;
+            strncpy(ptr, argv[i + 1], max_filename_len - 1);
+            filenames[i][max_filename_len - 1] = '\0';
+            ptr += max_filename_len;
+        }
+    }
+
+    MPI_Bcast(&num_files, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    if (rank != 0) {
+        total_buffer_size = num_files * max_filename_len;
+        filename_buffer = malloc(total_buffer_size * sizeof(char));
+        filenames = malloc(num_files * sizeof(char *));
+        if (!filename_buffer || !filenames) {
+            LOG(rank, "Failed to allocate filename buffers");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        for (int i = 0; i < num_files; i++) {
+            filenames[i] = filename_buffer + i * max_filename_len;
+        }
+    }
+
+    MPI_Bcast(filename_buffer, total_buffer_size, MPI_CHAR, 0, MPI_COMM_WORLD);
+
+    HashMap *local_map = create_hashmap(HASH_TABLE_SIZE);
+    for (int i = rank; i < num_files; i += size) {
+        LOG(rank, "Assigned file: %s", filenames[i]);
+        HashMap *tmp = process_file(filenames[i], delims, rank);
+        if (tmp) {
+            merge_hashmaps(local_map, tmp);
+            free_hashmap(tmp);
+        }
+    }
+
+    free(filename_buffer);
+    free(filenames);
+
+    char *send_buffer;
+    int send_length;
+    serialize_hashmap(local_map, &send_buffer, &send_length, rank);
+
+    int *recv_lengths = NULL;
+    int *displs = NULL;
+    char *recv_buffer = NULL;
+    if (rank == 0) {
+        recv_lengths = malloc(size * sizeof(int));
+        displs = malloc(size * sizeof(int));
+        if (!recv_lengths || !displs) {
+            LOG(0, "Failed to allocate gather buffers");
+            free_hashmap(local_map);
+            free(send_buffer);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+
+    MPI_Gather(&send_length, 1, MPI_INT, recv_lengths, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        int total_length = 0;
+        for (int i = 0; i < size; i++) {
+            displs[i] = total_length;
+            total_length += recv_lengths[i];
+        }
+        if (total_length > MAX_BUFFER_SIZE) {
+            LOG(0, "Total gathered size %d exceeds max %d", total_length, MAX_BUFFER_SIZE);
+            free(recv_lengths);
+            free(displs);
+            free_hashmap(local_map);
+            free(send_buffer);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        recv_buffer = malloc(total_length);
+        if (!recv_buffer) {
+            LOG(0, "Failed to allocate receive buffer");
+            free(recv_lengths);
+            free(displs);
+            free_hashmap(local_map);
+            free(send_buffer);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+
+    MPI_Gatherv(send_buffer, send_length, MPI_CHAR, recv_buffer, recv_lengths, displs, MPI_CHAR, 0, MPI_COMM_WORLD);
+    free(send_buffer);
+
+    if (rank == 0) {
+        HashMap *global_map = create_hashmap(HASH_TABLE_SIZE);
+        merge_hashmaps(global_map, local_map);
+        for (int i = 1; i < size; i++) {
+            if (recv_lengths[i] > 0) {
+                deserialize_hashmap(global_map, recv_buffer + displs[i], recv_lengths[i], rank);
+            }
+        }
+        double end_time = MPI_Wtime();
+        printf("Processing time: %f seconds\n", end_time - start_time);
+        print_results(global_map, 10);
+        free_hashmap(global_map);
+        free(recv_buffer);
+        free(recv_lengths);
+        free(displs);
+    }
+
+    free_hashmap(local_map);
     MPI_Finalize();
-    return 1;
-  }
-
-  double start_time = MPI_Wtime();
-  int num_files = argc - 1;
-  LOG(rank, "Processing %d files", num_files);
-
-  // Process files
-  HashMap *local_map = create_hashmap(HASH_TABLE_SIZE);
-  for (int i = rank; i < argc - 1; i += size) {
-    LOG(rank, "Assigned file: %s", argv[i + 1]);
-    const char *filename = argv[i + 1];
-    HashMap *tmp = process_file(filename, delims, rank);
-    if (tmp) {
-      merge_hashmaps(local_map, tmp);
-      free_hashmap(tmp);
-    }
-  }
-
-  // Serialize local map
-  char *send_buffer;
-  int send_length;
-  serialize_hashmap(local_map, &send_buffer, &send_length, rank);
-
-  // Gather lengths
-  int *recv_lengths = NULL;
-  int *displs = NULL;
-  char *recv_buffer = NULL;
-  if (rank == 0) {
-    recv_lengths = malloc(size * sizeof(int));
-    displs = malloc(size * sizeof(int));
-    if (!recv_lengths || !displs) {
-      LOG(0, "Failed to allocate gather buffers");
-      free_hashmap(local_map);
-      free(send_buffer);
-      MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-  }
-
-  MPI_Gather(&send_length, 1, MPI_INT, recv_lengths, 1, MPI_INT, 0,
-             MPI_COMM_WORLD);
-
-  // Gather data
-  if (rank == 0) {
-    int total_length = 0;
-    for (int i = 0; i < size; i++) {
-      displs[i] = total_length;
-      total_length += recv_lengths[i];
-    }
-    if (total_length > MAX_BUFFER_SIZE) {
-      LOG(0, "Total gathered size %d exceeds max %d", total_length,
-          MAX_BUFFER_SIZE);
-      free(recv_lengths);
-      free(displs);
-      free_hashmap(local_map);
-      free(send_buffer);
-      MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    recv_buffer = malloc(total_length);
-    if (!recv_buffer) {
-      LOG(0, "Failed to allocate receive buffer");
-      free(recv_lengths);
-      free(displs);
-      free_hashmap(local_map);
-      free(send_buffer);
-      MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-  }
-
-  MPI_Gatherv(send_buffer, send_length, MPI_CHAR, recv_buffer, recv_lengths,
-              displs, MPI_CHAR, 0, MPI_COMM_WORLD);
-  free(send_buffer);
-
-  // Process gathered data
-  if (rank == 0) {
-    HashMap *global_map = create_hashmap(HASH_TABLE_SIZE);
-    merge_hashmaps(global_map, local_map);
-    for (int i = 1; i < size; i++) {
-      if (recv_lengths[i] > 0) {
-        deserialize_hashmap(global_map, recv_buffer + displs[i],
-                            recv_lengths[i], rank);
-      }
-    }
-    double end_time = MPI_Wtime();
-    LOG(rank, "Processing time: %f seconds", end_time - start_time);
-    print_results(global_map, 10);
-    free_hashmap(global_map);
-    free(recv_buffer);
-    free(recv_lengths);
-    free(displs);
-  }
-
-  free_hashmap(local_map);
-  MPI_Finalize();
-  return 0;
+    return 0;
 }
