@@ -1,23 +1,31 @@
-CC = /usr/local/opt/gcc/bin/gcc-14
-CFLAGS = -Wall -fopenmp -g
-LDFLAGS = -lm
-MPIFLAGS = -np 4 --oversubscribe
+# Compilers
+CC      ?= gcc
+MPICC   ?= mpicc
 
-all: wordfreq_omp wordfreq_mpi 
+# Flags
+CFLAGS  ?= -Wall -fopenmp-extensions -g
+LDFLAGS ?= -lm
+MPIFLAGS ?= -np 4 --oversubscribe
+
+# Folder for benchmark input files
+FOLDER  ?= ./res
+
+# Targets
+all: wordfreq_omp wordfreq_mpi
 
 wordfreq_omp: wordfreq_omp.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 wordfreq_mpi: wordfreq_mpi.c
-	mpicc -o wordfreq_mpi wordfreq_mpi.c
+	$(MPICC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 clean:
 	rm -f wordfreq_omp wordfreq_mpi
 
-benchmark-omp: all 
-	./wordfreq_omp -b -n 8 ./res/*.txt
+benchmark-omp: wordfreq_omp
+	./wordfreq_omp -b -n 8 $(FOLDER)/*.txt
 
-benchmark-mpi: all 
-	mpirun ${MPIFLAGS} ./wordfreq_mpi ./res/*.txt
+benchmark-mpi: wordfreq_mpi
+	mpiexec $(MPIFLAGS) ./wordfreq_mpi $(FOLDER)/*.txt
 
-.PHONY: all clean benchmark
+.PHONY: all clean benchmark-omp benchmark-mpi
